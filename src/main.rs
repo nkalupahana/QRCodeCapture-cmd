@@ -5,25 +5,9 @@ use num_traits::FromPrimitive;
 #[derive(num_derive::FromPrimitive, Debug)]
 enum PixelFormat {
     A8 = 0x00000008,
-    JPEG = 0x00000100,
-    La88 = 0x0000000a,
-    L8 = 0x00000009,
-    OPAQUE = 0xffffffff,
-    Rgba1010102 = 0x0000002b,
-    Rgba4444 = 0x00000007,
-    Rgba5551 = 0x00000006,
-    Rgba8888 = 0x00000001,
-    RgbaF16 = 0x00000016,
-    Rgbx8888 = 0x00000002,
-    Rgb332 = 0x0000000b,
-    Rgb565 = 0x00000004,
-    Rgb888 = 0x00000003,
-    TRANSLUCENT = 0xfffffffd,
-    TRANSPARENT = 0xfffffffe,
-    UNKNOWN = 0x00000000,
-    YcbCr420Sp = 0x00000011,
-    YcbCr422I = 0x00000014,
-    YcbCr422Sp = 0x00000010,
+    RGBA4444 = 0x00000007,
+    RGBA8888 = 0x00000001,
+    RGB565 = 0x00000004,
 }
 
 fn capture_screen() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
