@@ -1,10 +1,13 @@
 use clap::Parser;
+use log::{debug, error, info, trace, warn};
 use num_traits::FromPrimitive;
 use rxing::{
     common::HybridBinarizer, qrcode::QRCodeReader, BinaryBitmap, ImmutableReader,
     Luma8LuminanceSource,
 };
+use serde_json::json;
 use std::process::Command;
+use tokio::task::JoinHandle;
 
 #[derive(num_derive::FromPrimitive, Debug)]
 enum PixelFormat {
@@ -97,7 +100,7 @@ fn capture_screen() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     Ok(output.stdout)
 }
 
-fn parse_screen_capture() -> Result<Image, Box<dyn std::error::Error>> {
+fn capture_screen_and_parse() -> Result<Image, Box<dyn std::error::Error>> {
     let data = capture_screen()?;
 
     if data.len() < 12 {
@@ -110,7 +113,7 @@ fn parse_screen_capture() -> Result<Image, Box<dyn std::error::Error>> {
     let height = u32::from_le_bytes(data[4..8].try_into()?);
     let pixel_format = u32::from_le_bytes(data[8..12].try_into()?);
     let pixel_format = PixelFormat::from_u32(pixel_format)
-        .ok_or_else(|| format!("Invalisd PixelFormat {pixel_format}"))?;
+        .ok_or_else(|| format!("Invalid PixelFormat {pixel_format}"))?;
 
     // Get pixel data (everything after the 12-byte header)
     let pixel_data = data[12..].to_vec();
@@ -121,10 +124,6 @@ fn parse_screen_capture() -> Result<Image, Box<dyn std::error::Error>> {
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// API token for KV store
-    #[arg(short, long)]
-    token: String,
-
     /// X coordinate of top left corner of crop position
     #[arg(short, default_value_t = 0)]
     x: u32,
@@ -140,26 +139,119 @@ struct Args {
     /// Height of cropped region
     #[arg(long, default_value_t = 100)]
     height: u32,
+
+    /// KV store URL
+    #[arg(long)]
+    api_url: String,
+
+    /// API token for KV store
+    #[arg(short, long)]
+    token: String,
+
+    /// Loop interval. If not provided, the program will only run once.
+    #[arg(long)]
+    interval: Option<humantime::Duration>,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Starting");
-    let args = Args::parse();
+fn send_to_kv_store(text: &str, args: &Args) -> JoinHandle<()> {
+    let text = text.to_string();
+    let token = args.token.clone();
+    let api_url = args.api_url.clone();
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let result = client
+            .post(api_url)
+            .json(&json!({ "campusbevi": text, "token": token }))
+            .send()
+            .await;
+        result.map_or_else(
+            |error| error!("Failed to send to KV Store {error:#?}"),
+            |response| {
+                info!("Successfully sent '{text}' to KV Store");
+                trace!("Response: {response:#?}");
+            },
+        );
+    })
+}
 
-    let reader = QRCodeReader::default();
+enum QrCodeTask {
+    NoRequest,
+    Request(JoinHandle<()>),
+}
 
-    let raw_data = capture_screen()?;
-    println!("Captured {} bytes", raw_data.len());
+impl From<()> for QrCodeTask {
+    fn from(_: ()) -> Self {
+        QrCodeTask::NoRequest
+    }
+}
 
-    let image = parse_screen_capture()?;
-    println!("Captured image: {:#?}", image);
-    println!("Pixel data size: {} bytes", image.pixels.len());
+fn parse_qr_code(
+    args: &Args,
+    reader: &QRCodeReader,
+    last_result: &mut String,
+) -> Result<QrCodeTask, Box<dyn std::error::Error>> {
+    let image = capture_screen_and_parse()?;
+    debug!("Captured image: {image:#?}");
 
     let mut binary_bitmap =
         image.crop_and_create_binary_bitmap(args.x, args.y, args.width, args.height);
-    let result = reader.immutable_decode(&mut binary_bitmap)?;
-    let text = result.getText();
-    println!("Text: {}", text);
+    let result = reader.immutable_decode(&mut binary_bitmap);
+    if let Ok(result) = result {
+        let text = result.getText();
+        debug!("Text: {}", text);
+        if text != last_result {
+            let task = send_to_kv_store(text, &args);
+            info!("Detected new QR code '{text}'");
+            *last_result = text.to_string();
+            return Ok(QrCodeTask::Request(task));
+        }
+    };
+    Ok(QrCodeTask::NoRequest)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+
+    let args = Args::parse();
+    let mut last_result = String::new();
+
+    let reader = QRCodeReader::default();
+
+    let interval = args.interval;
+
+    let task = match interval {
+        Some(interval) => loop {
+            let iteration_start = std::time::Instant::now();
+            let next_iteration = iteration_start + interval.into();
+            parse_qr_code(&args, &reader, &mut last_result)?;
+            let iteration_end = std::time::Instant::now();
+            
+            let parse_duration = iteration_end.duration_since(iteration_start);
+            debug!(
+                "Iteration took ({})",
+                humantime::format_duration(parse_duration)
+            );
+            
+            let sleep_duration = next_iteration.duration_since(iteration_end);
+            if sleep_duration.is_zero() {
+                let slow_by_duration = iteration_end.duration_since(next_iteration);
+                warn!(
+                    "Loop overrun! Iteration took ({}), slow by ({})",
+                    humantime::format_duration(parse_duration),
+                    humantime::format_duration(slow_by_duration)
+                );
+            } else {
+                std::thread::sleep(sleep_duration);
+            };
+        },
+        None => parse_qr_code(&args, &reader, &mut last_result)?,
+    };
+
+    match task {
+        QrCodeTask::Request(task) => task.await?,
+        QrCodeTask::NoRequest => (),
+    }
 
     Ok(())
 }
