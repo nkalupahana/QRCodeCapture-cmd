@@ -72,16 +72,25 @@ impl Image {
         width: u32,
         height: u32,
     ) -> BinaryBitmap<HybridBinarizer<Luma8LuminanceSource>> {
-        // Calculate the offset and size of the cropped image
-        let offset = (y * self.width + x) * self.format.bytes_per_pixel();
-        let size = width * height * self.format.bytes_per_pixel();
-        let (offset, size) = (offset as usize, size as usize);
+        let bytes_per_pixel = self.format.bytes_per_pixel();
+        let scale_dim = |dim| (dim * bytes_per_pixel) as usize;
 
-        let cropped = &self.pixels[offset..offset + size];
-        let luma_vec = cropped
-            .chunks(self.format.bytes_per_pixel() as usize)
-            .map(|pixels| self.format.get_channel(pixels[0]))
+        let scaled_image_width = scale_dim(self.width);
+        let scaled_x = scale_dim(x);
+        let scaled_width = scale_dim(width);
+        let cropped = self
+            .pixels
+            .chunks_exact(scaled_image_width)
+            .skip(y as usize)
+            .take(height as usize)
+            .flat_map(|f| f.iter().skip(scaled_x).take(scaled_width))
+            .collect::<Vec<&u8>>();
+        assert_eq!(scale_dim(width * height), cropped.len());
+        let luma_vec: Vec<u8> = cropped
+            .chunks(bytes_per_pixel as usize)
+            .map(|pixels| self.format.get_channel(*pixels[0]))
             .collect();
+        assert_eq!((width * height) as usize, luma_vec.len());
 
         BinaryBitmap::new(HybridBinarizer::new(Luma8LuminanceSource::new(
             luma_vec, width, height,
@@ -133,7 +142,7 @@ struct Args {
     y: u32,
 
     /// Width of cropped region
-    #[arg(short, long, default_value_t = 100)]
+    #[arg(long, default_value_t = 100)]
     width: u32,
 
     /// Height of cropped region
@@ -151,17 +160,32 @@ struct Args {
     /// Loop interval. If not provided, the program will only run once.
     #[arg(long)]
     interval: Option<humantime::Duration>,
+
+    /// Any strings provided here will be removed from the output text before sending to the KV store.
+    #[arg(short, long, num_args=1..)]
+    substitute: Vec<String>,
+
+    /// The key to use for KV API
+    #[arg(short, long)]
+    key: String,
 }
 
 fn send_to_kv_store(text: &str, args: &Args) -> JoinHandle<()> {
     let text = text.to_string();
     let token = args.token.clone();
     let api_url = args.api_url.clone();
+    let key = args.key.clone();
+
+    let text = args
+        .substitute
+        .iter()
+        .fold(text, |text, substitute| text.replace(substitute, ""));
+
     tokio::spawn(async move {
         let client = reqwest::Client::new();
         let result = client
             .post(api_url)
-            .json(&json!({ "campusbevi": text, "token": token }))
+            .json(&json!({ key: text, "token": token }))
             .send()
             .await;
         result.map_or_else(
@@ -226,13 +250,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let next_iteration = iteration_start + interval.into();
             parse_qr_code(&args, &reader, &mut last_result)?;
             let iteration_end = std::time::Instant::now();
-            
+
             let parse_duration = iteration_end.duration_since(iteration_start);
             debug!(
                 "Iteration took ({})",
                 humantime::format_duration(parse_duration)
             );
-            
+
             let sleep_duration = next_iteration.duration_since(iteration_end);
             if sleep_duration.is_zero() {
                 let slow_by_duration = iteration_end.duration_since(next_iteration);
